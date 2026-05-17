@@ -206,8 +206,12 @@ class ActorRolloutRefWorker(Worker):
         else:
             torch_dtype = PrecisionType.to_dtype(torch_dtype)
 
-        # override model kwargs
-        actor_model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code, attn_implementation="flash_attention_2")
+        attn_implementation = self.config.model.get("attn_implementation", "sdpa")
+        actor_model_config = AutoConfig.from_pretrained(
+            local_path,
+            trust_remote_code=trust_remote_code,
+            attn_implementation=attn_implementation,
+        )
                 
         # patch for kimi-vl
         if getattr(actor_model_config, "model_type", None) == "kimi_vl":
@@ -1176,7 +1180,12 @@ class CriticWorker(Worker):
 
         from transformers import AutoConfig, AutoModelForTokenClassification
 
-        critic_model_config = AutoConfig.from_pretrained(local_path, attn_implementation="flash_attention_2", trust_remote_code=config.model.get("trust_remote_code", False))
+        attn_implementation = config.model.get("attn_implementation", "sdpa")
+        critic_model_config = AutoConfig.from_pretrained(
+            local_path,
+            attn_implementation=attn_implementation,
+            trust_remote_code=config.model.get("trust_remote_code", False),
+        )
         critic_model_config.num_labels = 1
         # patch for kimi-vl
         if getattr(critic_model_config, "model_type", None) == "kimi_vl":
@@ -1500,7 +1509,7 @@ class RewardModelWorker(Worker):
                 pretrained_model_name_or_path=local_path,
                 config=model_config,
                 torch_dtype=torch.bfloat16,
-                attn_implementation="flash_attention_2",
+                attn_implementation=config.model.get("attn_implementation", "sdpa"),
                 trust_remote_code=trust_remote_code,
             )
 
@@ -1552,11 +1561,6 @@ class RewardModelWorker(Worker):
         self.reward_module = self._build_model(config=self.config)
 
     def _forward_micro_batch(self, micro_batch):
-        if is_cuda_available:
-            from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
-        elif is_npu_available:
-            from transformers.integrations.npu_flash_attention import pad_input, unpad_input, rearrange, index_first_axis
-
         from verl.utils.ulysses import gather_outpus_and_unpad, ulysses_pad_and_slice_inputs
 
         with torch.no_grad(), torch.autocast(device_type=device_name, dtype=torch.bfloat16):
@@ -1566,6 +1570,11 @@ class RewardModelWorker(Worker):
             position_ids = micro_batch["position_ids"]
 
             if self.use_remove_padding:
+                if is_cuda_available:
+                    from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+                elif is_npu_available:
+                    from transformers.integrations.npu_flash_attention import pad_input, unpad_input, rearrange, index_first_axis
+
                 input_ids_rmpad, indices, *_ = unpad_input(input_ids.unsqueeze(-1), attention_mask)  # input_ids_rmpad (total_nnz, ...)
                 input_ids_rmpad = input_ids_rmpad.transpose(0, 1)  # (1, total_nnz)
 

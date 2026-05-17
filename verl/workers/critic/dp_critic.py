@@ -21,7 +21,6 @@ import os
 
 import torch
 import torch.distributed
-from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
 from torch import nn, optim
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
@@ -38,7 +37,10 @@ from verl.utils.device import get_device_name, get_torch_device, is_npu_availabl
 
 
 if is_cuda_available:
-    from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
+    try:
+        from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
+    except ImportError:
+        pad_input = unpad_input = rearrange = index_first_axis = None
 elif is_npu_available:
     from transformers.integrations.npu_flash_attention import pad_input, unpad_input, rearrange, index_first_axis
 
@@ -55,6 +57,11 @@ class DataParallelPPOCritic(BasePPOCritic):
         print(f"Critic use_remove_padding={self.use_remove_padding}")
 
         self.ulysses_sequence_parallel_size = self.config.get("ulysses_sequence_parallel_size", 1)
+        if (self.use_remove_padding or self.ulysses_sequence_parallel_size > 1) and is_cuda_available and unpad_input is None:
+            raise ImportError(
+                "flash-attn is required when use_remove_padding=True or ulysses_sequence_parallel_size>1 on CUDA. "
+                "Set critic.model.use_remove_padding=False and critic.ulysses_sequence_parallel_size=1 to use PyTorch SDPA without flash-attn."
+            )
         self.device_name = get_device_name()
 
     def _forward_micro_batch(self, micro_batch):
@@ -78,8 +85,7 @@ class DataParallelPPOCritic(BasePPOCritic):
 
                 # unpad the position_ids to align the rotary
                 if position_ids.dim() == 3:
-                    position_ids_rmpad =
-                    index_first_axis(rearrange(position_ids, "c b s ... -> (b s) c ..."), indices).transpose(0, 1).unsqueeze(1)  # (4, bsz, seqlen) -> (4, 1, bsz * seqlen)
+                    position_ids_rmpad = index_first_axis(rearrange(position_ids, "c b s ... -> (b s) c ..."), indices).transpose(0, 1).unsqueeze(1)  # (4, bsz, seqlen) -> (4, 1, bsz * seqlen)
                 else:
                     position_ids_rmpad = index_first_axis(rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices).transpose(0, 1)
 

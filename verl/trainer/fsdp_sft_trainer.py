@@ -69,7 +69,10 @@ from verl.workers.sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManage
 
 
 if is_cuda_available:
-    from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
+    try:
+        from flash_attn.bert_padding import pad_input, unpad_input, rearrange, index_first_axis
+    except ImportError:
+        pad_input = unpad_input = rearrange = index_first_axis = None
 elif is_npu_available:
     from transformers.integrations.npu_flash_attention import pad_input, unpad_input, rearrange, index_first_axis
 
@@ -100,6 +103,11 @@ class FSDPSFTTrainer:
         # Set sequence parallel size
         self.config.ulysses_sequence_parallel_size = getattr(self.config, "ulysses_sequence_parallel_size", 1)
         self.use_remove_padding = getattr(self.config, "use_remove_padding", False)
+        if (self.use_remove_padding or self.config.ulysses_sequence_parallel_size > 1) and is_cuda_available and unpad_input is None:
+            raise ImportError(
+                "flash-attn is required when use_remove_padding=True or ulysses_sequence_parallel_size>1 on CUDA. "
+                "Set use_remove_padding=False and ulysses_sequence_parallel_size=1 to use PyTorch SDPA without flash-attn."
+            )
         if self.device_mesh.get_rank() == 0:
             print(f"Using sequence parallel size: {self.config.ulysses_sequence_parallel_size}")
             print(f"Using remove padding: {self.use_remove_padding}")
@@ -194,7 +202,7 @@ class FSDPSFTTrainer:
                 local_model_path,
                 config=config,
                 torch_dtype=torch.float32,
-                attn_implementation="flash_attention_2",
+                attn_implementation=getattr(self.config.model, "attn_implementation", "sdpa"),
                 trust_remote_code=trust_remote_code,
             )
 

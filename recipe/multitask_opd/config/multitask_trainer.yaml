@@ -56,7 +56,8 @@ actor_rollout_ref:
     override_config: {}
     enable_gradient_checkpointing: True
     enable_activation_offload: False
-    use_remove_padding: True
+    use_remove_padding: False
+    attn_implementation: sdpa
     lora_rank: 0
     lora_alpha: 16
     target_modules: all-linear

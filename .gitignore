@@ -136,6 +136,10 @@ log
 *.out
 outputs
 
+# local literature source caches
+research/opd_citations/papers/*.pdf
+research/opd_citations/sources/
+
 # appworld
 data/
 .tmp

@@ -172,7 +172,7 @@ class MultiTaskRefWorker(Worker):
         actor_model_config = AutoConfig.from_pretrained(
             model_path,
             trust_remote_code=trust_remote_code,
-            attn_implementation="flash_attention_2"
+            attn_implementation=self.config.model.get("attn_implementation", "sdpa"),
         )
         
         # Override model config with tokenizer settings

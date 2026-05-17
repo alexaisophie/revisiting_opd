@@ -43,7 +43,10 @@ from verl.utils.ulysses import gather_outpus_and_unpad, ulysses_pad_and_slice_in
 from verl.workers.actor import BasePPOActor
 
 if is_cuda_available:
-    from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+    try:
+        from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
+    except ImportError:
+        index_first_axis = pad_input = rearrange = unpad_input = None
 elif is_npu_available:
     from transformers.integrations.npu_flash_attention import index_first_axis, pad_input, rearrange, unpad_input
 
@@ -69,6 +72,11 @@ class DataParallelPPOActor(BasePPOActor):
 
         self.ulysses_sequence_parallel_size = self.config.ulysses_sequence_parallel_size
         self.use_ulysses_sp = self.ulysses_sequence_parallel_size > 1
+        if (self.use_remove_padding or self.use_ulysses_sp) and is_cuda_available and unpad_input is None:
+            raise ImportError(
+                "flash-attn is required when use_remove_padding=True or ulysses_sequence_parallel_size>1 on CUDA. "
+                "Set use_remove_padding=False and ulysses_sequence_parallel_size=1 to use PyTorch SDPA without flash-attn."
+            )
 
         self.compute_entropy_from_logits = (
             torch.compile(verl_F.entropy_from_logits, dynamic=True)
