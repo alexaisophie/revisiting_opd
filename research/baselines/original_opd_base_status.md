@@ -54,12 +54,29 @@ tag    = pre-experiment-sdpa-trustopd-20260517
   - `actor_rollout_ref.model.use_remove_padding=False`
   - `actor_rollout_ref.model.attn_implementation=sdpa`
 - 修复 `verl/workers/critic/dp_critic.py` 中一个原有语法错误。
+- 兼容 Transformers 5 中 `AutoModelForVision2Seq` 的重命名/迁移。
+- 兼容 vLLM 0.21 的 LoRA import 路径变化，非 LoRA 路径不再因旧 import 失败。
 
 这些改动的目的：
 
 - 让原作 baseline 能在当前 Blackwell + PyTorch 2.11 环境跑起来；
 - 不引入新的 TrustOPD gate/weight；
 - 不改变原作 OPD / Teacher-TopK 的算法公式。
+
+当前 Blackwell 单卡运行 vLLM 0.21 还需要以下环境项：
+
+```bash
+pip install nvidia-cuda-runtime==13.0.96 nvidia-cuda-nvrtc==13.0.88
+
+export LD_LIBRARY_PATH=/root/autodl-tmp/conda_envs/opd-bw/lib/python3.12/site-packages/nvidia/cu13/lib:${LD_LIBRARY_PATH:-}
+export VLLM_USE_FLASHINFER_SAMPLER=0
+```
+
+原因：
+
+- vLLM 0.21 wheel 会加载 CUDA 13 runtime/NVRTC 动态库；
+- 当前 PyTorch 是 `2.11.0+cu128`，在 Blackwell `sm_120` 上 vLLM/FlashInfer 会提示 `SM 12.x requires CUDA >= 12.9`；
+- 关闭 FlashInfer sampler 后，vLLM 使用 PyTorch-native top-k/top-p sampler，能跑通 smoke，但这不是性能最优路径。
 
 ## 4. 原作方案 baseline 定义
 
@@ -211,18 +228,17 @@ examples/opd/opd_original_math_qwen2.5_7b_it.sh
 
 ## 6. 当前建议
 
-下一步不要直接改 TrustOPD。应先做：
+当前两个单卡 smoke baseline 均已跑通。下一步不要直接改 TrustOPD，应先把这个环境可运行快照提交并推送到 GitHub，然后从该快照派生实验分支：
 
-1. 新增两个单卡 smoke baseline 脚本：
-   - `examples/opd/run_baseline_teacher_topk_math_smoke.sh`
-   - `examples/opd/run_baseline_sampled_opd_math_smoke.sh`
-2. 用当前 tag `pre-experiment-sdpa-trustopd-20260517` 跑 Teacher-TopK smoke。
-3. 如果 Teacher-TopK smoke 通过，再跑 sampled-token OPD smoke。
-4. 把结果写回本文档。
+1. `baseline/pre-experiment-sdpa-trustopd`：只保留环境适配、中文文档、baseline smoke 脚本。
+2. `exp/original-opd-small-math`：跑 sampled-token OPD 小规模数字。
+3. `exp/teacher-topk-small-math`：跑 Teacher-TopK 小规模数字。
+4. `exp/trustopd-*`：在前两个 baseline 数字稳定后再开始 TrustOPD 方向。
 
 ## 7. Baseline 运行日志
 
 | 日期 | baseline | commit/tag | 命令/脚本 | 结果 | 下一步 |
 | --- | --- | --- | --- | --- | --- |
 | 2026-05-17 | pre-experiment snapshot | `3c22bdb`, `pre-experiment-sdpa-trustopd-20260517` | push branch/tag | 已上传 GitHub | 新增单卡 smoke baseline 脚本 |
-
+| 2026-05-17 | Teacher-TopK smoke | branch `baseline/pre-experiment-sdpa-trustopd` | `bash examples/opd/run_baseline_teacher_topk_math_smoke.sh vllm`，本次 `TEST_FREQ=2` | 2 step 通过；日志 `logs/baseline/teacher-topk-math-smoke_0517_102155.log`；step 2 `actor/kl_loss=0.684`，`actor/not_in_topk_ratio=0.000`，验证 `gsm8k=0.602`、`math-500=0.394`、`aime-2024=0.000` | 后续正式 baseline 恢复/实现 `kl_topk_source=ref` 的 shared-vocab 处理 |
+| 2026-05-17 | sampled-token OPD smoke | branch `baseline/pre-experiment-sdpa-trustopd` | `bash examples/opd/run_baseline_sampled_opd_math_smoke.sh vllm`，默认 `TEST_FREQ=-1` | 2 step 通过；日志 `logs/baseline/sampled-opd-math-smoke_0517_102838.log`；step 2 `actor/pg_loss=0.807`，`critic/rewards/mean=-413.016`，无验证 | 可扩到小规模 train/eval |
