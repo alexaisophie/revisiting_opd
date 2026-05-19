@@ -737,7 +737,7 @@ class RayPPOTrainer:
         except Exception as e:
             print(f"Warning: Could not set total_training_steps in config. Structure missing? Error: {e}")
 
-    def _dump_generations(self, inputs, outputs, scores, reward_extra_infos_dict, dump_path):
+    def _dump_generations(self, inputs, outputs, scores, reward_extra_infos_dict, dump_path, gts=None):
         """Dump rollout/validation samples as JSONL."""
         os.makedirs(dump_path, exist_ok=True)
         filename = os.path.join(dump_path, f"{self.global_steps}.jsonl")
@@ -749,6 +749,8 @@ class RayPPOTrainer:
             "score": scores,
             "step": [self.global_steps] * n,
         }
+        if gts is not None:
+            base_data["gts"] = gts
 
         for k, v in reward_extra_infos_dict.items():
             if len(v) == n:
@@ -760,6 +762,104 @@ class RayPPOTrainer:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
         print(f"Dumped generations to {filename}")
+
+    def _log_rollout_data(
+        self, batch: DataProto, reward_extra_infos_dict: dict, timing_raw: dict, rollout_data_dir: str
+    ):
+        """Log rollout data to disk."""
+        with _timer("dump_rollout_generations", timing_raw):
+            inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
+            outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
+            scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
+            sample_gts = [item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in batch]
+
+            reward_extra_infos_to_dump = {}
+            for key, value in reward_extra_infos_dict.items():
+                if isinstance(value, torch.Tensor):
+                    if value.dim() == 1:
+                        reward_extra_infos_to_dump[key] = value.detach().cpu().tolist()
+                    continue
+                reward_extra_infos_to_dump[key] = value
+
+            if "request_id" in batch.non_tensor_batch:
+                reward_extra_infos_to_dump.setdefault(
+                    "request_id",
+                    batch.non_tensor_batch["request_id"].tolist(),
+                )
+
+            self._dump_generations(
+                inputs=inputs,
+                outputs=outputs,
+                gts=sample_gts,
+                scores=scores,
+                reward_extra_infos_dict=reward_extra_infos_to_dump,
+                dump_path=rollout_data_dir,
+            )
+
+    def _attach_rollout_dump_infos(self, batch: DataProto, reward_extra_infos_dict: dict):
+        """Attach scalar per-rollout diagnostics to the existing rollout JSONL dump."""
+        if reward_extra_infos_dict is None:
+            return
+
+        response_mask = batch.batch.get("response_mask", None)
+
+        def _to_list(value):
+            if isinstance(value, torch.Tensor):
+                return value.detach().cpu().tolist()
+            if isinstance(value, np.ndarray):
+                return value.tolist()
+            return list(value)
+
+        def _set_if_absent(key: str, value):
+            if value is not None and key not in reward_extra_infos_dict:
+                reward_extra_infos_dict[key] = value
+
+        def _masked_reduce(value, reduce: str):
+            if value is None:
+                return None
+            if not isinstance(value, torch.Tensor):
+                value = torch.as_tensor(value)
+            if value.dim() == 1:
+                return value.detach().cpu().tolist()
+            if response_mask is None:
+                return None
+
+            value = value.float()
+            mask = response_mask.to(device=value.device, dtype=value.dtype)
+            if value.dim() == mask.dim():
+                expanded_mask = mask
+            elif value.dim() == mask.dim() + 1:
+                expanded_mask = mask.unsqueeze(-1).expand_as(value)
+            else:
+                return None
+
+            dims = tuple(range(1, value.dim()))
+            total = (value * expanded_mask).sum(dim=dims)
+            if reduce == "sum":
+                return total.detach().cpu().tolist()
+
+            denom = expanded_mask.sum(dim=dims).clamp_min(1.0)
+            return (total / denom).detach().cpu().tolist()
+
+        if "uid" in batch.non_tensor_batch:
+            _set_if_absent("uid", _to_list(batch.non_tensor_batch["uid"]))
+        if "data_source" in batch.non_tensor_batch:
+            _set_if_absent("data_source", _to_list(batch.non_tensor_batch["data_source"]))
+        if "extra_info" in batch.non_tensor_batch:
+            extra_infos = _to_list(batch.non_tensor_batch["extra_info"])
+            _set_if_absent(
+                "extra_info.index",
+                [item.get("index") if isinstance(item, dict) else None for item in extra_infos],
+            )
+
+        if response_mask is not None:
+            _set_if_absent("response_length", response_mask.sum(dim=-1).detach().cpu().tolist())
+
+        _set_if_absent("actor/entropy_mean", _masked_reduce(batch.batch.get("entropys", None), "mean"))
+
+        _set_if_absent("critic/score", _masked_reduce(batch.batch.get("token_level_scores", None), "sum"))
+        _set_if_absent("critic/rewards", _masked_reduce(batch.batch.get("token_level_rewards", None), "sum"))
+        _set_if_absent("critic/returns", _masked_reduce(batch.batch.get("returns", None), "mean"))
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
@@ -1251,6 +1351,8 @@ class RayPPOTrainer:
                     # compute global_valid tokens
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
+                    reward_extra_infos_dict = None
+                    rollout_dump_extra_infos = {}
                     with _timer("reward", timing_raw):
                         # compute reward model score
                         if self.use_rm:
@@ -1296,6 +1398,14 @@ class RayPPOTrainer:
                                 "actor/entropy_mask_kept_ratio": kept / max(total, 1.0),
                                 "actor/entropy_mask_kept_tokens": kept,
                             })
+
+                        if self.config.trainer.get("rollout_data_dir", None):
+                            had_batch_entropys = "entropys" in batch.batch
+                            if not had_batch_entropys:
+                                batch.batch["entropys"] = entropys
+                            self._attach_rollout_dump_infos(batch, rollout_dump_extra_infos)
+                            if not had_batch_entropys:
+                                batch.batch.pop("entropys", None)
 
                         old_log_prob.batch.pop("entropys")
                         batch = batch.union(old_log_prob)
@@ -1442,11 +1552,15 @@ class RayPPOTrainer:
                         reward_extra_infos_dict: dict[str, list]
                         if self.config.reward_model.launch_reward_fn_async:
                             reward_tensor, reward_extra_infos_dict = ray.get(future_reward)
+                        if reward_extra_infos_dict is None:
+                            reward_extra_infos_dict = {}
                         batch.batch["token_level_scores"] = reward_tensor
 
                         print(f"{list(reward_extra_infos_dict.keys())=}")
                         if reward_extra_infos_dict:
                             batch.non_tensor_batch.update({k: np.array(v) for k, v in reward_extra_infos_dict.items()})
+                        for key, value in rollout_dump_extra_infos.items():
+                            reward_extra_infos_dict.setdefault(key, value)
 
                         # compute rewards. apply_invalid_action_penalty if available
                         if self.config.actor_rollout_ref.actor.get('use_invalid_action_penalty', False):
@@ -1492,6 +1606,9 @@ class RayPPOTrainer:
                                 clip_log_ratio=self.config.actor_rollout_ref.actor.get("clip_log_ratio", False), # this config is not that naturally related to OPD, but we keep it here for compatibility
                             )
 
+                        if self.config.trainer.get("rollout_data_dir", None):
+                            self._attach_rollout_dump_infos(batch, reward_extra_infos_dict)
+
                     # update critic
                     if self.use_critic:
                         with _timer("update_critic", timing_raw):
@@ -1510,19 +1627,8 @@ class RayPPOTrainer:
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
-                    if rollout_data_dir:
-                        with _timer("dump_rollout_generations", timing_raw):
-                            print(batch.batch.keys())
-                            inputs = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
-                            outputs = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
-                            scores = batch.batch["token_level_scores"].sum(-1).cpu().tolist()
-                            self._dump_generations(
-                                inputs=inputs,
-                                outputs=outputs,
-                                scores=scores,
-                                reward_extra_infos_dict=reward_extra_infos_dict,
-                                dump_path=rollout_data_dir,
-                            )
+                    if rollout_data_dir and (self.global_steps == 1 or self.global_steps % self.config.trainer.get("log_rollout_freq", 50) == 0):
+                        self._log_rollout_data(batch, reward_extra_infos_dict, timing_raw, rollout_data_dir)
 
                     # validate
                     if self.val_reward_fn is not None and self.config.trainer.test_freq > 0 and (is_last_step or self.global_steps % self.config.trainer.test_freq == 0):

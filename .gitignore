@@ -147,3 +147,4 @@ analyze/
 /test_*.sh
 infer.py
 requirements.txt
+scripts/model_merge.sh
